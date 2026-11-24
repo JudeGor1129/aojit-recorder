@@ -17,8 +17,8 @@ on:
         default: "1.15"
         required: true
       modules:
-        description: "images.json keys, space separated"
-        default: "musl busybox python"
+        description: "images.json keys, space separated (pcre2 is always recorded separately)"
+        default: "musl busybox zlib python node crypto ssl sqlite imaging webp jpeg numpy ssh scp rg gh pyjson pyhashlib pyblake2 pystruct pydatetime pybinascii pymath pyzlib pysocket pyselect pyssl"
         required: true
       jobs:
         description: "Parallel recordings (JOBS); 2 is safe on 7 GB"
@@ -54,6 +54,10 @@ jobs:
       MODULES: ${{ inputs.modules }}
 
     steps:
+      # The catalog patcher and the fail-closed verifier live in this repo;
+      # OpenMinis itself is cloned into ./src by the next step.
+      - uses: actions/checkout@v4
+
       - name: Show environment
         run: |
           uname -m
@@ -157,7 +161,8 @@ jobs:
           echo "recording abi: $ABI"
           echo "ABI=$ABI" >> "$GITHUB_ENV"
           if [ "$ABI" != "1f3bb5a0" ]; then
-            echo "::warning::abi is $ABI, but Minis 1.15 expects 1f3bb5a0. Images will be rejected by the app."
+            echo "::error::abi is $ABI, but Minis 1.15 expects 1f3bb5a0. Every image would be rejected by the app."
+            exit 1
           fi
 
       - name: Probe the Alpine archive for the versions the catalog pins
@@ -224,7 +229,14 @@ jobs:
             "$ISH" -r "$R" /sbin/apk add $PKGS
           fi
           # The versions below decide which images match the catalog by build-id.
-          "$ISH" -r "$R" /bin/sh -c 'for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy; do printf "%-16s %s\n" "$p" "$(apk info -e $p 2>/dev/null | head -1)"; done'
+          "$ISH" -r "$R" /bin/sh -c 'for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy openssh-client-default openssh-client-common; do printf "%-16s %s\n" "$p" "$(apk info -e $p 2>/dev/null | head -1)"; done'
+          # catalog-sync.py needs "name version" (no "name-" prefix); this table
+          # is also what the fail-closed check compares the catalog against.
+          "$ISH" -r "$R" /bin/sh -c '
+            for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy openssh-client-default openssh-client-common; do
+              e=$(apk info -e "$p" 2>/dev/null | head -1)
+              [ -n "$e" ] && printf "%s %s\n" "$p" "${e#$p-}"
+            done' | tee "$GITHUB_WORKSPACE/versions.txt"
           "$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; /bin/busybox | head -1; python3 -V'
           if [ "${{ inputs.npm }}" = "true" ]; then
             NPM=$(python3 -c "import json;print(' '.join(json.load(open('deps/ish/benchmark/aojit/images.json'))['packages']['npm']))")
@@ -251,6 +263,36 @@ jobs:
             "$PWD/deps/resources/alpine-realfs" \
             "$PWD/out" $MODULES
 
+      - name: Record the PCRE2 image (absent from images.json)
+        working-directory: src
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          ISH="$PWD/deps/ish/build-arm64-jit/ish"
+          R="$PWD/deps/resources/alpine-realfs"
+          # AOJITSettingsView.swift lists PCRE2 but benchmark/aojit/images.json
+          # has no such workload, so record_images.sh skips it and the entry
+          # could never match. record.sh is driven directly for that one module.
+          mkdir -p "$R/tmp/aojit/pcre2" out/rec
+          cp "$GITHUB_WORKSPACE/scripts/pcre2_train.sh" "$R/tmp/aojit/pcre2/pcre2_train.sh"
+          chmod +x "$R/tmp/aojit/pcre2/pcre2_train.sh"
+          # /lib is a symlink to /usr/lib in Alpine; match the soname instead of
+          # a full path, which is also what record.sh wants (path substring).
+          find "$R" -name 'libpcre2-8.so.0*' -type f | head -3
+          test -n "$(find "$R" -name 'libpcre2-8.so.0*' -type f | head -1)" || {
+            echo "::error::libpcre2-8.so.0 is not in the rootfs; PCRE2 cannot be recorded"
+            exit 1
+          }
+          RECORDING="$PWD/out/rec/pcre2.jsonl" \
+            sh deps/ish/tools/jit_aot/record.sh \
+              "$ISH" "$R" /tmp/aojit/pcre2/pcre2_train.sh \
+              "$PWD/out/aot_pcre2.S" 'libpcre2-8.so.0'
+          test -s out/aot_pcre2.S || { echo "::error::aot_pcre2.S is empty"; exit 1; }
+          if [ "${IOS:-1}" = "1" ]; then
+            xcrun -sdk iphoneos clang -target arm64-apple-ios15.0 \
+              -c -o out/aot_pcre2_ios.o out/aot_pcre2.S
+          fi
+
       - name: Inspect the results
         working-directory: src
         run: |
@@ -273,6 +315,89 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
+
+      - name: Align the catalog with the recorded images
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # The settings page compares the build-id it reads out of the app's
+          # rootfs with the constants below. Those constants ship pinned to the
+          # official release's package set; a rootfs built today has different
+          # builds for several packages, so the page would say "mismatch" and the
+          # kernel would refuse images that are in fact correct for this build.
+          # Rewrite the constants to the build-ids just recorded. The gate itself
+          # is unchanged: it still demands an exact build-id, only the data is
+          # corrected.
+          python3 "$GITHUB_WORKSPACE/scripts/catalog-sync.py" \
+            --manifest out/aot-manifest.json \
+            --swift src/ios/Views/Rootfs/AOJITSettingsView.swift \
+            --versions "$GITHUB_WORKSPACE/versions.txt" \
+            --out out/AOJITSettingsView.patched.swift \
+            --report out/catalog-report.md
+          grep -c 'AOJITImage(' out/AOJITSettingsView.patched.swift
+
+      - name: Fail-closed check (catalog <-> images)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Refuses to publish unless every catalog constant is the build-id of
+          # the image in this artifact, under the recorded abi. A partially
+          # recorded set (e.g. a module whose workload is gone) fails here
+          # instead of shipping a catalog that claims more than the images do.
+          python3 "$GITHUB_WORKSPACE/scripts/verify-aojit.py" \
+            --manifest out/aot-manifest.json \
+            --swift out/AOJITSettingsView.patched.swift \
+            --catalog-sync "$GITHUB_WORKSPACE/scripts/catalog-sync.py" \
+            --versions "$GITHUB_WORKSPACE/versions.txt" \
+            --expect-abi "$ABI" | tee out/verify.txt
+
+      - name: Assemble libish_aot.a and write the integration note
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ "${IOS:-1}" = "1" ]; then
+            xcrun libtool -static -o out/libish_aot.a out/aot_*_ios.o
+            ls -lh out/libish_aot.a
+            xcrun nm -gU out/libish_aot.a | grep -c '^_ish_aot_module_' || {
+              echo "::error::libish_aot.a has no _ish_aot_module_ symbols"
+              exit 1
+            }
+          fi
+          {
+            echo "# AOJIT images for ${{ inputs.ref }} (run ${{ github.run_number }})"
+            echo
+            echo "- abi: \`$ABI\` (the app's kernel must report the same abi)"
+            echo "- ish submodule: \`$(git -C deps/ish rev-parse HEAD)\`"
+            echo "- recorded on: $(sw_vers -productVersion) / $(uname -m)"
+            echo "- rootfs: Alpine $(cat deps/resources/alpine-realfs/etc/alpine-release)"
+            echo
+            echo "## Use"
+            echo
+            echo "1. \`libish_aot.a\` -> \`deps/aot/libish_aot.a\` (replaces the official archive)."
+            echo "2. \`AOJITSettingsView.patched.swift\` -> \`src/ios/Views/Rootfs/AOJITSettingsView.swift\`."
+            echo "3. Build libish with \`-Djit=true -Djit_emit=false\` and link the archive with \`-force_load\` (the Minis target already does this)."
+            echo
+            echo "## Why both files are needed"
+            echo
+            echo "The kernel matches an image by the guest module's ELF build-id. The archive supplies the translations; the Swift catalog supplies the build-ids the settings page compares against. Replace only the archive and every row shows \"mismatch\" (the gate working as designed); replace only the catalog and the page claims images the archive does not have. Both come from this run, so the two agree by construction -- \`verify.txt\` is the proof, and the job fails if they do not."
+            echo
+            echo "The images are valid only for a rootfs whose packages are the ones in \`versions.txt\`. Rebuilding the app with a different Alpine snapshot invalidates them: record again rather than relax the gate."
+          } > out/INTEGRATION.md
+          cat out/INTEGRATION.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the catalog patch, the archive and the proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: aojit-catalog-${{ inputs.ref }}-run${{ github.run_number }}
+          path: |
+            src/out/AOJITSettingsView.patched.swift
+            src/out/catalog-report.md
+            src/out/verify.txt
+            src/out/INTEGRATION.md
+            src/out/libish_aot.a
+            versions.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload the manifest (a few KB, for the catalog patch)
         uses: actions/upload-artifact@v4
