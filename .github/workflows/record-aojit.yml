@@ -57,6 +57,8 @@ jobs:
       - name: Show environment
         run: |
           uname -m
+          uname -a
+          echo "hostname: '$(uname -n)' -> $(uname -n | wc -c) bytes incl. newline"
           sw_vers
           xcodebuild -version
           df -h /
@@ -85,6 +87,33 @@ jobs:
             https://github.com/OpenMinis/OpenMinis.git src
           echo "--- submodule commits (store these next to the images) ---"
           git -C src submodule status
+
+      - name: Patch kernel/uname.c (fortify-safe copies)
+        working-directory: src/deps/ish
+        run: |
+          # do_uname() strcpy()s the host nodename into char hostname[65].
+          # Under the 26 SDK the strcpy is fortify-checked, so any hostname
+          # that does not fit (or an unset one, leaving stack garbage in
+          # real_uname) aborts the whole ish process with
+          # "HOST CRASH: signal 5 ... __chk_fail_overflow ... sys_uname".
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("kernel/uname.c")
+          s = p.read_text()
+          subs = [
+              ("    struct utsname real_uname;\n    uname(&real_uname);",
+               "    struct utsname real_uname;\n    memset(&real_uname, 0, sizeof(real_uname));\n    uname(&real_uname);"),
+              ("    strcpy(uts->hostname, hostname);",
+               "    snprintf(uts->hostname, sizeof(uts->hostname), \"%s\",\n            hostname != NULL && hostname[0] != '\\0' ? hostname : \"ish\");"),
+          ]
+          for old, new in subs:
+              if old not in s:
+                  sys.exit("patch target not found, upstream changed: %r" % old)
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          print("patched kernel/uname.c")
+          PY
+          sed -n '18,34p' kernel/uname.c
 
       - name: Build the CLI iSH (JIT, run-time translation)
         working-directory: src/deps/ish
@@ -142,6 +171,11 @@ jobs:
           # rootfs ships -- so those two images match by build-id, not just family.
           PKGS=$(python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
           echo "apk add: $PKGS"
+          set +e
+          echo "--- guest uname (must not abort) ---"
+          "$ISH" -r "$R" /bin/uname -a
+          echo "guest uname exit=$?"
+          set -e
           "$ISH" -r "$R" /sbin/apk add $PKGS
           "$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; /bin/busybox | head -1; python3 -V'
           if [ "${{ inputs.npm }}" = "true" ]; then
