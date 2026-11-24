@@ -33,7 +33,8 @@ gh run download -n aojit-images-1.15-run1 -D out
 | 装 meson/ninja/libarchive | libarchive 是 `fakefsify` 的依赖 |
 | clone `--branch <ref> --recurse-submodules` | `deps/ish` 必须是**同一个提交**，否则 abi 对不上 |
 | 编 `build-arm64-jit`（`-Djit=true -Djit_emit=true`） | 录制**必须**能运行时翻译；App 里那份是 `jit_emit=false`，只能消费镜像 |
-| `prepare_alpine_rootfs.sh 3.21` | 用**未升级**的 3.21.0 minirootfs：musl 1.2.5-r8、busybox 1.37.0-r8，与 App 内置 rootfs 完全一致 |
+| 解压 `alpine-minirootfs-3.21.0` 成**普通目录树** | `record.sh` 用 `ish -r <rootfs>`，而 `-r` 是 **realfs**、`-f` 才是 fakefs（`xX_main_Xx.h` 的 `getopt` 串 `+r:f:d:c:n:`）。把 fakefs 目录传给 `-r` 会报 `xX_main_Xx: No such file or directory` |
+| 用未升级的 3.21.0 minirootfs | musl 1.2.5-r8、busybox 1.37.0-r8，与 App 内置 rootfs 完全一致 |
 | `apk add`（**不带 `-u`**） | 加了 `-u` 会把 musl/busybox 升到 r11/r14，build-id 就与 App 不匹配了，只能退化成 family matching |
 | `install.sh` | 把 `guest/` 拷进 `/tmp/aojit` 并生成输入（需要 python3/numpy/matplotlib/node 已装好） |
 | `record_images.sh` | 逐模块录，`IOS=1` 时顺带 `xcrun -sdk iphoneos clang` 汇编 `.o` |
