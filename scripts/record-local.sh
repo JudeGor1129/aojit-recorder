@@ -16,7 +16,7 @@ MODULES=("$@")
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$HERE/src"
 ISH="$SRC/deps/ish/build-arm64-jit/ish"
-R="$SRC/deps/resources/alpine-rootfs"
+R="$SRC/deps/resources/alpine-realfs"
 JSON="$SRC/deps/ish/benchmark/aojit/images.json"
 
 say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -56,8 +56,16 @@ say "Building the CLI iSH (JIT, run-time translation)"
   ninja -C build-arm64-jit
 )
 
-say "Preparing the Alpine rootfs"
-(cd "$SRC" && ./deps/prepare_alpine_rootfs.sh 3.21)
+say "Preparing the Alpine rootfs (realfs tree)"
+# record.sh runs `ish -r <rootfs>`, and -r is realfs; -f is fakefs. A fakefs
+# directory handed to -r fails with "xX_main_Xx: No such file or directory".
+V=3.21.0
+rm -rf "$R"; mkdir -p "$R"
+curl -fsSL -o /tmp/rootfs.tar.gz \
+  "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-$V-aarch64.tar.gz"
+tar -xzf /tmp/rootfs.tar.gz -C "$R"
+printf 'nameserver 8.8.8.8\nnameserver 8.4.4.4\n' > "$R/etc/resolv.conf"
+du -sh "$R"; cat "$R/etc/alpine-release"
 
 say "Recording abi"
 ABI=$(ISH_JIT_PIC=1 "$ISH" -r "$R" /bin/cat /proc/ish/jit | grep -o 'abi [0-9a-f]*' | cut -d' ' -f2)
@@ -69,7 +77,7 @@ say "Installing the guest packages"
 MSTR="${MODULES[*]}"
 PKGS=$(cd "$SRC" && MSTR="$MSTR" python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MSTR"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
 "$ISH" -r "$R" /sbin/apk add $PKGS
-"$ISH" -r "$R" /usr/bin/pip install --break-system-packages python-pptx
+"$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; python3 -V'
 
 say "Installing the AOJIT workloads"
 (cd "$SRC" && ./deps/ish/benchmark/aojit/install.sh "$ISH" "$R")
