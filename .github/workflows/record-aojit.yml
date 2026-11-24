@@ -193,13 +193,15 @@ jobs:
           # (1.2.5-r8 / 1.37.0-r8), which is exactly what the app's built-in
           # rootfs ships -- so those two images match by build-id, not just family.
           #
-          # `openssl` (the CLI) is dropped on purpose: it depends on
-          # libssl3=3.3.7-r2 and so upgrades libcrypto3/libssl3 away from the
-          # 3.3.2-r4 the catalog was recorded against. deps/aot/tools/
-          # record_local.sh states the same rule ("never install the openssl CLI
-          # in the guest: it upgrades libcrypto3"). The TLS workloads drive
-          # python3's ssl module, not the CLI, so nothing needs it.
-          PKGS=$(python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s={"openssl"};s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
+          # `openssl` (the CLI) has to stay: guest/net/tls_server.py generates the
+          # localhost certificates with it, and tls_run.sh spins in
+          # `while [ ! -f server_<port>.ready ]` forever when it is missing.
+          # The cost is a libcrypto3/libssl3 bump (3.3.2-r4 -> 3.3.7-r2), i.e.
+          # those two images match the catalog by family, not by build-id.
+          # deps/aot/tools/record_local.sh avoids that by building the certs on
+          # the host and recording on a second, CLI-free rootfs; this workflow
+          # keeps one rootfs and takes the family match instead.
+          PKGS=$(python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
           echo "apk add: $PKGS"
           if [ "${ARCHIVE:-no}" = "yes" ]; then
             # Point the guest at the archived v3.21 tree: every package then
@@ -238,6 +240,10 @@ jobs:
 
       - name: Record the images
         working-directory: src
+        # A workload that waits for a file that never appears (tls_run.sh does
+        # exactly that when the cert generator fails) would otherwise hang until
+        # the 6 h job limit; fail fast instead.
+        timeout-minutes: 40
         run: |
           mkdir -p out
           ./deps/ish/benchmark/aojit/record_images.sh \
