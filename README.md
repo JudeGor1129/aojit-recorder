@@ -6,16 +6,52 @@
 
 ## 实测结果（2026-11-24，macos-26 runner）
 
-一次跑通，**全程 8 分 35 秒**，产物 25 MB：
+全量 27 个模块，**12 分 18 秒**，产物 172 MB（`27 × .S` + `27 × _ios.o`）：
 
-| 镜像 | 大小 | 翻译条数 | 对应模块 | build-id 校验 |
-|---|---|---|---|---|
-| `aot_musl.S` | 17 MB | 4 180 | `/lib/ld-musl-aarch64.so.1` 1.2.5-r8 | ✅ 与 App 内置**完全一致**（`384940f9…c217b5`） |
-| `aot_busybox.S` | 27 MB | 6 554 | `/bin/busybox` 1.37.0-r8 | ✅ 与 App 内置**完全一致**（`2f8b429e…028ee8`） |
-| `aot_python.S` | 202 MB | 48 515 | `/usr/lib/libpython3.12.so.1.0` | 随 Alpine 3.21 的 python3 版本走 |
-| `*_ios.o` | 4.5 / 6.9 / 51 MB | — | `ISH_AOT_OBJECTS` 用 | — |
+| 项目 | 值 |
+|---|---|
+| 镜像数 | 27（覆盖官方 catalog 的 24/25） |
+| abi | `1f3bb5a0`（与 Minis 1.15 一致） |
+| 总翻译条数 | 360,902 |
+| 与官方 build-id 逐字节相同 | **9 个**：musl、busybox、zlib、sqlite、pillow、webp、jpeg、numpy、scp |
+| 只能 family matching | 15 个（python3、nodejs、openssl、ssh 及 10 个 py 扩展） |
+| 录不了 | `pcre2`（workload 不在公开仓库，见下） |
 
-录出来的 **abi = `1f3bb5a0`**，与 Minis 1.15 期望值一致；musl/busybox 两个不是 family matching，而是按 build-id 精确命中（因为 3.21.0 minirootfs 自带的就是 App 里那两版包）。
+musl / busybox / zlib 之所以能精确命中，是因为 rootfs 用的是钉死的 `alpine-minirootfs-3.21.0` tarball，里面就是 r8 / r8 / 1.3.1-r2，与 App 内置 rootfs 完全一致；`apk add` 刻意**不带 `-u`**，否则会升到 r12 / r14 而掉成 family。
+
+## 为什么 15 个只能 family
+
+官方镜像是 2026-10-05 录的，build-id 绑死当时的包版本，而 Alpine 只保留当前版本：
+
+| 包 | 官方 | 今天 |
+|---|---|---|
+| python3 | 3.12.15-r0 | 3.12.16-r0 |
+| nodejs | 22.23.2-r0 | 22.23.5-r0 |
+| libcrypto3 / libssl3 | 3.3.2-r4 | 3.3.7-r2 |
+| pcre2 | 10.43-r0 | 10.43-r1 |
+| openssh-client-* | 9.9_p2-r0 | 9.9_p2-r1 |
+
+`archive.alpinelinux.org` 也已不可用（探测返回 000），旧包无从取回。这不是录制方法的问题——录制器就是官方那套脚本，abi 也一致，变的是 guest 里的 ELF。
+
+**但 family 不等于没用**：`build_aot.sh` 原文写着 "a mismatch is not an error, the runtime just rejects or never hits that image"，状态是逐模块四态判定。而且自编 App 的 rootfs 也是从今天的 Alpine 装的，装出来正是 3.12.16 / 3.3.7-r2，所以那 15 个在你的 App 上实际是精确命中——只是设置页里 2026-10 的硬编码常量「以为」它不匹配。
+
+## 让设置页说实话：catalog-sync.py
+
+```bash
+python3 scripts/catalog-sync.py \
+  --manifest aot-manifest.json \
+  --swift src/ios/Views/Rootfs/AOJITSettingsView.swift \
+  --versions versions.txt \
+  --out AOJITSettingsView.patched.swift
+```
+
+`aot-manifest.json` 由 CI 的 manifest artifact 产出（几 KB），`versions.txt` 是 `apk add` 之后各包的实际版本。脚本只改 `buildId` 和 `package` 标签，`file:` 是纯显示字段、不动。本次运行改写了 16 条、保留 9 条。
+
+## 两个坑
+
+**`openssl` CLI 会把 libcrypto3 顶上去。** `record_local.sh` 的注释写着 "never install the openssl CLI in the guest: it upgrades libcrypto3"。但删掉它更糟：`guest/net/tls_server.py` 用它生成 localhost 证书，而 `tls_run.sh` 里是 `while [ ! -f server_$port.ready ]; do sleep 0.1; done`，证书出不来就是死循环（实测挂了 34 分钟）。所以保留 CLI、接受 family，并给录制步骤加 `timeout-minutes: 40`。
+
+**`pcre2` 录不了。** 它在官方 catalog 里是 coreRole，却不在 `images.json` 的 workload 列表里，而是走 `record_local.sh pcre2`，需要 `/tmp/aojit/minis/pcre_train.sh` —— 这个脚本在 `ish-arm64` 公开树里搜不到。影响很小：pcre2 是给 rg 用的，官方自测 ripgrep 命中率只有 3–6%。
 
 ## 为什么需要录
 
