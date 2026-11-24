@@ -21,8 +21,8 @@ on:
         default: "musl busybox zlib python node crypto ssl sqlite imaging webp jpeg numpy ssh scp rg gh pyjson pyhashlib pyblake2 pystruct pydatetime pybinascii pymath pyzlib pysocket pyselect pyssl"
         required: true
       jobs:
-        description: "Parallel recordings (JOBS); 2 is safe on 7 GB"
-        default: "2"
+        description: "Parallel recordings (JOBS); 3 is what the 14 GB runner handled"
+        default: "3"
         required: true
       ios:
         description: "Also assemble the iOS .o objects"
@@ -238,11 +238,12 @@ jobs:
               [ -n "$e" ] && printf "%s %s\n" "$p" "${e#$p-}"
             done' | tee "$GITHUB_WORKSPACE/versions.txt"
           "$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; /bin/busybox | head -1; python3 -V'
-          # pcre2grep and GNU grep both execute libpcre2-8, which is what the
-          # PCRE2 image has to record. Busybox grep has no -P and would leave
-          # the recording empty ("expected one module ... got []").
-          "$ISH" -r "$R" /sbin/apk add pcre2-tools grep
-          "$ISH" -r "$R" /bin/sh -c 'pcre2grep --version | head -1; grep --version | head -1'
+          # pcre2grep drives libpcre2-8, which is what the PCRE2 image has to
+          # record. Only the tools package is added: replacing busybox grep with
+          # GNU grep in the guest made the existing workloads hang, so the
+          # workload uses pcre2grep alone.
+          "$ISH" -r "$R" /sbin/apk add pcre2-tools
+          "$ISH" -r "$R" /bin/sh -c 'pcre2grep --version | head -1'
           if [ "${{ inputs.npm }}" = "true" ]; then
             NPM=$(python3 -c "import json;print(' '.join(json.load(open('deps/ish/benchmark/aojit/images.json'))['packages']['npm']))")
             "$ISH" -r "$R" /bin/sh -c "npm i -g --no-audit --no-fund $NPM"
