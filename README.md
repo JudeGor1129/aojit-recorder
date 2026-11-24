@@ -4,6 +4,19 @@
 
 公开仓库下 macOS arm64 runner **免费且不限分钟**，一个仓库、点一下按钮就能跑。
 
+## 实测结果（2026-11-24，macos-26 runner）
+
+一次跑通，**全程 8 分 35 秒**，产物 25 MB：
+
+| 镜像 | 大小 | 翻译条数 | 对应模块 | build-id 校验 |
+|---|---|---|---|---|
+| `aot_musl.S` | 17 MB | 4 180 | `/lib/ld-musl-aarch64.so.1` 1.2.5-r8 | ✅ 与 App 内置**完全一致**（`384940f9…c217b5`） |
+| `aot_busybox.S` | 27 MB | 6 554 | `/bin/busybox` 1.37.0-r8 | ✅ 与 App 内置**完全一致**（`2f8b429e…028ee8`） |
+| `aot_python.S` | 202 MB | 48 515 | `/usr/lib/libpython3.12.so.1.0` | 随 Alpine 3.21 的 python3 版本走 |
+| `*_ios.o` | 4.5 / 6.9 / 51 MB | — | `ISH_AOT_OBJECTS` 用 | — |
+
+录出来的 **abi = `1f3bb5a0`**，与 Minis 1.15 期望值一致；musl/busybox 两个不是 family matching，而是按 build-id 精确命中（因为 3.21.0 minirootfs 自带的就是 App 里那两版包）。
+
 ## 为什么需要录
 
 OpenMinis 源码里 `deps/aot/` 只有文档和工具，**镜像本体被 gitignore**（约 1 GB 汇编）。
@@ -16,7 +29,7 @@ OpenMinis 源码里 `deps/aot/` 只有文档和工具，**镜像本体被 gitign
 1. 把本目录推到自己的 **public** 仓库
 2. 仓库页 → **Actions** → `Record AOJIT images` → **Run workflow**
 3. 默认参数：`ref=1.15`、`modules="musl busybox python"`、`jobs=2`、`ios=true`
-4. 约 **40–90 分钟**，产物在 Artifact 里（`aot_*.S` + `aot_*_ios.o`）
+4. 约 **9 分钟**（实测 8m35s；只录 musl+busybox 更快），产物在 Artifact 里（`aot_*.S` + `aot_*_ios.o`）
 
 命令行等价：
 
@@ -32,12 +45,29 @@ gh run download -n aojit-images-1.15-run1 -D out
 |---|---|
 | 装 meson/ninja/libarchive | libarchive 是 `fakefsify` 的依赖 |
 | clone `--branch <ref> --recurse-submodules` | `deps/ish` 必须是**同一个提交**，否则 abi 对不上 |
+| 打 `kernel/uname.c` 补丁 | 见下节。不打的话 `apk add` 必崩 |
 | 编 `build-arm64-jit`（`-Djit=true -Djit_emit=true`） | 录制**必须**能运行时翻译；App 里那份是 `jit_emit=false`，只能消费镜像 |
 | 解压 `alpine-minirootfs-3.21.0` 成**普通目录树** | `record.sh` 用 `ish -r <rootfs>`，而 `-r` 是 **realfs**、`-f` 才是 fakefs（`xX_main_Xx.h` 的 `getopt` 串 `+r:f:d:c:n:`）。把 fakefs 目录传给 `-r` 会报 `xX_main_Xx: No such file or directory` |
 | 用未升级的 3.21.0 minirootfs | musl 1.2.5-r8、busybox 1.37.0-r8，与 App 内置 rootfs 完全一致 |
 | `apk add`（**不带 `-u`**） | 加了 `-u` 会把 musl/busybox 升到 r11/r14，build-id 就与 App 不匹配了，只能退化成 family matching |
 | `install.sh` | 把 `guest/` 拷进 `/tmp/aojit` 并生成输入（需要 python3/numpy/matplotlib/node 已装好） |
 | `record_images.sh` | 逐模块录，`IOS=1` 时顺带 `xcrun -sdk iphoneos clang` 汇编 `.o` |
+
+## 必须打的补丁：`kernel/uname.c`
+
+`do_uname()` 里有一句 `strcpy(uts->hostname, real_uname.nodename)`，目标是 `char hostname[65]`。
+macOS 26 SDK 会把这个 `strcpy` 换成 fortify 版本，**主机名放不进 65 字节就整进程 abort**：
+
+```
+HOST CRASH: signal 5
+__chk_fail_overflow -> stpcpy -> sys_uname+196
+```
+
+GitHub 的 runner 主机名长达 68 字符（`iad20-gt1018-…-1E6E0D25816F.local`），于是 `apk add` 装到一半必崩、exit 139。
+本地 Mac 上通常没事，但一旦主机名长或 `uname()` 返回未初始化内容，同样会崩。
+
+workflow 第 5 步把这两行改成「先 `memset` 再 `snprintf` 截断」，就彻底解决了。
+这是**为自动化环境打的适配补丁**，不影响镜像内容。
 
 ## 产物怎么用
 
@@ -72,6 +102,10 @@ job summary 会把这几个值都打出来，**存到镜像旁边**，将来重�
 
 | 现象 | 原因与处理 |
 |---|---|
+| `exit code 139` / `HOST CRASH: signal 5` + `__chk_fail_overflow` + `sys_uname` | `kernel/uname.c` 的主机名 `strcpy` 溢出，见上一节。别删那个补丁步骤 |
+| `call to undeclared function 'posix_spawn_file_actions_addchdir'` | runner 的 Xcode 太旧（`macos-15` 只有 16.4）。必须 `runs-on: macos-26` |
+| `invalid linker name in argument '-fuse-ld=lld'` | 缺 `ld.lld`；新版 Homebrew 已把它从 `llvm` 拆成独立 formula，装 `lld` |
+| `xX_main_Xx: No such file or directory` | rootfs 被当成 realfs 用了：`-r` 只认普通目录树，fakefs 要走 `-f` |
 | `record.sh` 报 `a step failed` | 某个 workload 输出里有 `FAIL/Traceback/not found`，通常是包没装全（python3、node、matplotlib）。看它打印的 5 行日志定位 |
 | `apk add` 407 / 解析失败 | runner 到 `dl-cdn.alpinelinux.org` 的网络问题，重跑一次 |
 | `image_info.py` 显示 abi 不是 `1f3bb5a0` | `ref` 变了或子模块被更新过，改用 `ref=1.15` 重新跑 |
