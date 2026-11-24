@@ -1,0 +1,195 @@
+name: Record AOJIT images
+
+# Records OpenMinis AOJIT images on a GitHub-hosted arm64 macOS runner.
+# Free and unlimited for public repositories.
+#
+# Pipeline (verified against OpenMinis 1.15, deps/ish @0fd17a1):
+#   JIT CLI ish -> Alpine 3.21 fakefs rootfs -> apk packages -> suite -> record -> .S/.o
+#
+# The images are tied to (a) the abi of the ish that recorded them and
+# (b) each guest module's ELF build-id. Both are printed in the job summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "OpenMinis tag/branch/commit to record against (1.15 -> abi 1f3bb5a0)"
+        default: "1.15"
+        required: true
+      modules:
+        description: "images.json keys, space separated"
+        default: "musl busybox python"
+        required: true
+      jobs:
+        description: "Parallel recordings (JOBS); 2 is safe on 7 GB"
+        default: "2"
+        required: true
+      ios:
+        description: "Also assemble the iOS .o objects"
+        type: boolean
+        default: true
+      npm:
+        description: "Install the npm packages the node workload starts (slow, only for node)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aojit-record
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # Standard arm64 macOS runner: 3 vCPU (M1), 7 GB RAM, 14 GB free SSD.
+    # macos-latest / macos-26 are also arm64 if this image is retired.
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      JOBS: ${{ inputs.jobs }}
+      IOS: ${{ inputs.ios && '1' || '0' }}
+      MODULES: ${{ inputs.modules }}
+
+    steps:
+      - name: Show environment
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
+          df -h /
+
+      - name: Assert Apple Silicon
+        run: |
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "::error::Runner is $(uname -m); AOJIT images must be recorded on arm64."
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          brew install meson ninja libarchive
+          python3 -m pip install --user tqdm 2>/dev/null \
+            || python3 -m pip install --user --break-system-packages tqdm
+
+      - name: Clone OpenMinis at the pinned ref
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/OpenMinis/OpenMinis.git src
+          echo "--- submodule commits (store these next to the images) ---"
+          git -C src submodule status
+
+      - name: Build the CLI iSH (JIT, run-time translation)
+        working-directory: src/deps/ish
+        run: |
+          meson setup build-arm64-jit \
+            --buildtype=release \
+            -Dlog="" \
+            -Dkernel=ish \
+            -Dengine=asbestos \
+            -Dguest_arch=arm64 \
+            -Djit=true \
+            -Djit_emit=true
+          ninja -C build-arm64-jit
+          ls -lh build-arm64-jit/ish
+
+      - name: Prepare the Alpine rootfs (bare 3.21 minirootfs)
+        working-directory: src
+        run: ./deps/prepare_alpine_rootfs.sh 3.21
+
+      - name: Print the recording abi
+        working-directory: src
+        run: |
+          ISH="$PWD/deps/ish/build-arm64-jit/ish"
+          R="$PWD/deps/resources/alpine-rootfs"
+          # Same PIC convention record.sh uses; a non-PIC build reports another abi.
+          ABI=$(ISH_JIT_PIC=1 "$ISH" -r "$R" /bin/cat /proc/ish/jit | grep -o 'abi [0-9a-f]*' | cut -d' ' -f2)
+          echo "recording abi: $ABI"
+          echo "ABI=$ABI" >> "$GITHUB_ENV"
+          if [ "$ABI" != "1f3bb5a0" ]; then
+            echo "::warning::abi is $ABI, but Minis 1.15 expects 1f3bb5a0. Images will be rejected by the app."
+          fi
+
+      - name: Install the guest packages
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ISH="$PWD/deps/ish/build-arm64-jit/ish"
+          R="$PWD/deps/resources/alpine-rootfs"
+          J=benchmark/aojit/images.json
+          # apk add WITHOUT -u: keeps musl/busybox at the minirootfs versions
+          # (1.2.5-r8 / 1.37.0-r8), which is exactly what the app's built-in
+          # rootfs ships -- so those two images match by build-id, not just family.
+          PKGS=$(python3 -c 'import json,os;d=json.load(open("benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
+          echo "apk add: $PKGS"
+          "$ISH" -r "$R" /sbin/apk add $PKGS
+          "$ISH" -r "$R" /usr/bin/pip install --break-system-packages python-pptx
+          if [ "${{ inputs.npm }}" = "true" ]; then
+            NPM=$(python3 -c "import json;print(' '.join(json.load(open('$J'))['packages']['npm']))")
+            "$ISH" -r "$R" /bin/sh -c "npm i -g --no-audit --no-fund $NPM"
+          fi
+          "$ISH" -r "$R" /bin/sh -c 'ldd /bin/busybox | head -3; ls -l /usr/bin/python3 /usr/bin/node 2>/dev/null || true'
+
+      - name: Install the AOJIT workloads and generate inputs
+        working-directory: src
+        run: |
+          ./deps/ish/benchmark/aojit/install.sh \
+            "$PWD/deps/ish/build-arm64-jit/ish" \
+            "$PWD/deps/resources/alpine-rootfs"
+
+      - name: Record the images
+        working-directory: src
+        run: |
+          mkdir -p out
+          ./deps/ish/benchmark/aojit/record_images.sh \
+            "$PWD/deps/ish/build-arm64-jit/ish" \
+            "$PWD/deps/resources/alpine-rootfs" \
+            "$PWD/out" $MODULES
+
+      - name: Inspect the results
+        working-directory: src
+        run: |
+          set +e
+          ls -lh out
+          {
+            echo "### AOJIT images for \`${{ inputs.ref }}\`"
+            echo
+            echo "- abi: \`${ABI}\` (Minis 1.15 expects \`1f3bb5a0\`)"
+            echo "- ish submodule: \`$(git -C deps/ish rev-parse HEAD)\`"
+            echo
+            echo "| file | size |"
+            echo "|---|---|"
+            for f in out/aot_*.S; do
+              [ -e "$f" ] || continue
+              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+            for f in out/aot_*_ios.o; do
+              [ -e "$f" ] || continue
+              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+            echo
+            echo "<details><summary>image_info.py</summary>"
+            echo
+            echo '```'
+            for f in out/aot_*.S; do
+              [ -e "$f" ] || continue
+              echo "== $(basename "$f")"
+              python3 deps/aot/tools/image_info.py "$f" 2>&1 | head -12
+            done
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload the images
+        uses: actions/upload-artifact@v4
+        with:
+          name: aojit-images-${{ inputs.ref }}-run${{ github.run_number }}
+          path: |
+            src/out/aot_*.S
+            src/out/aot_*_ios.o
+          if-no-files-found: error
+          retention-days: 14
