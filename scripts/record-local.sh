@@ -32,6 +32,10 @@ say "Installing build tools"
 brew list meson >/dev/null 2>&1 || brew install meson
 brew list ninja >/dev/null 2>&1 || brew install ninja
 brew list libarchive >/dev/null 2>&1 || brew install libarchive
+# llvm provides ld.lld, needed for the guest VDSO (-fuse-ld=lld); keg-only.
+brew list llvm >/dev/null 2>&1 || brew install llvm
+brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+export PATH="$(brew --prefix llvm)/bin:$PATH"
 python3 -m pip install --user --quiet tqdm 2>/dev/null \
   || python3 -m pip install --user --quiet --break-system-packages tqdm
 
