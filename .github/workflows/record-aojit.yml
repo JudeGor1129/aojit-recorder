@@ -365,8 +365,11 @@ jobs:
           if [ "${IOS:-1}" = "1" ]; then
             xcrun libtool -static -o out/libish_aot.a out/aot_*_ios.o
             ls -lh out/libish_aot.a
-            xcrun nm -gU out/libish_aot.a | grep -c '^_ish_aot_module_' || {
-              echo "::error::libish_aot.a has no _ish_aot_module_ symbols"
+            # nm prints "<addr> T <symbol>", so match anywhere in the line.
+            SYMS=$(xcrun nm -gU out/libish_aot.a | grep -c '_ish_aot_module_' || true)
+            echo "module symbols: $SYMS"
+            [ "$SYMS" -ge 25 ] || {
+              echo "::error::expected at least 25 _ish_aot_module_ symbols, got $SYMS"
               exit 1
             }
           fi
