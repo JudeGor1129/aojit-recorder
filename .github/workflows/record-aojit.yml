@@ -160,6 +160,29 @@ jobs:
             echo "::warning::abi is $ABI, but Minis 1.15 expects 1f3bb5a0. Images will be rejected by the app."
           fi
 
+      - name: Probe the Alpine archive for the versions the catalog pins
+        run: |
+          set +e
+          ARCH="https://archive.alpinelinux.org/alpine/v3.21"
+          miss=0
+          for p in \
+            main/aarch64/python3-3.12.15-r0.apk \
+            main/aarch64/pcre2-10.43-r0.apk \
+            main/aarch64/nodejs-22.23.2-r0.apk \
+            main/aarch64/openssh-client-default-9.9_p2-r0.apk \
+            main/aarch64/libssl3-3.3.2-r4.apk ; do
+            code=$(curl -s -o /dev/null -m 12 -w "%{http_code}" -r 0-1023 "$ARCH/$p")
+            echo "  $code  $p"
+            [ "$code" = "206" ] || [ "$code" = "200" ] || miss=$((miss+1))
+          done
+          if [ "$miss" -eq 0 ]; then
+            echo "ARCHIVE=yes" >> "$GITHUB_ENV"
+            echo "archive usable: the 2026-10 package set is still fetchable"
+          else
+            echo "ARCHIVE=no" >> "$GITHUB_ENV"
+            echo "archive unusable ($miss of 5 missing): will record against today's repo"
+          fi
+
       - name: Install the guest packages
         working-directory: src
         run: |
@@ -169,14 +192,37 @@ jobs:
           # apk add WITHOUT -u: keeps musl/busybox at the minirootfs versions
           # (1.2.5-r8 / 1.37.0-r8), which is exactly what the app's built-in
           # rootfs ships -- so those two images match by build-id, not just family.
-          PKGS=$(python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
+          #
+          # `openssl` (the CLI) is dropped on purpose: it depends on
+          # libssl3=3.3.7-r2 and so upgrades libcrypto3/libssl3 away from the
+          # 3.3.2-r4 the catalog was recorded against. deps/aot/tools/
+          # record_local.sh states the same rule ("never install the openssl CLI
+          # in the guest: it upgrades libcrypto3"). The TLS workloads drive
+          # python3's ssl module, not the CLI, so nothing needs it.
+          PKGS=$(python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MODULES"].split();s={"openssl"};s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
           echo "apk add: $PKGS"
+          if [ "${ARCHIVE:-no}" = "yes" ]; then
+            # Point the guest at the archived v3.21 tree: every package then
+            # resolves to the version the app's catalog was recorded against.
+            printf '%s\n%s\n' \
+              "https://archive.alpinelinux.org/alpine/v3.21/main" \
+              "https://archive.alpinelinux.org/alpine/v3.21/community" > "$R/etc/apk/repositories"
+            echo "repositories -> archive.alpinelinux.org (2026-10 snapshot)"
+          fi
           set +e
           echo "--- guest uname (must not abort) ---"
           "$ISH" -r "$R" /bin/uname -a
           echo "guest uname exit=$?"
           set -e
-          "$ISH" -r "$R" /sbin/apk add $PKGS
+          if ! "$ISH" -r "$R" /sbin/apk add $PKGS; then
+            echo "::warning::install against the archive failed, falling back to today's repo"
+            printf '%s\n%s\n' \
+              "https://dl-cdn.alpinelinux.org/alpine/v3.21/main" \
+              "https://dl-cdn.alpinelinux.org/alpine/v3.21/community" > "$R/etc/apk/repositories"
+            "$ISH" -r "$R" /sbin/apk add $PKGS
+          fi
+          # The versions below decide which images match the catalog by build-id.
+          "$ISH" -r "$R" /bin/sh -c 'for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy; do printf "%-16s %s\n" "$p" "$(apk info -e $p 2>/dev/null | head -1)"; done'
           "$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; /bin/busybox | head -1; python3 -V'
           if [ "${{ inputs.npm }}" = "true" ]; then
             NPM=$(python3 -c "import json;print(' '.join(json.load(open('deps/ish/benchmark/aojit/images.json'))['packages']['npm']))")
@@ -204,36 +250,31 @@ jobs:
         run: |
           set +e
           ls -lh out
+          echo "### image_info.py (one line per image)"
+          python3 deps/aot/tools/image_info.py out | tee /tmp/images.txt
+          python3 deps/aot/tools/image_info.py --json out > out/aot-manifest.json
+          echo "### manifest"
+          cat out/aot-manifest.json
           {
             echo "### AOJIT images for \`${{ inputs.ref }}\`"
             echo
             echo "- abi: \`${ABI}\` (Minis 1.15 expects \`1f3bb5a0\`)"
             echo "- ish submodule: \`$(git -C deps/ish rev-parse HEAD)\`"
-            echo
-            echo "| file | size |"
-            echo "|---|---|"
-            for f in out/aot_*.S; do
-              [ -e "$f" ] || continue
-              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
-            done
-            for f in out/aot_*_ios.o; do
-              [ -e "$f" ] || continue
-              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
-            done
-            echo
-            echo "<details><summary>image_info.py</summary>"
+            echo "- archive repo: \`${ARCHIVE:-no}\`"
             echo
             echo '```'
-            for f in out/aot_*.S; do
-              [ -e "$f" ] || continue
-              echo "== $(basename "$f")"
-              python3 deps/aot/tools/image_info.py "$f" 2>&1 | head -12
-            done
+            cat /tmp/images.txt
             echo '```'
-            echo
-            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
+
+      - name: Upload the manifest (a few KB, for the catalog patch)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aojit-manifest-${{ inputs.ref }}-run${{ github.run_number }}
+          path: src/out/aot-manifest.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload the images
         uses: actions/upload-artifact@v4
