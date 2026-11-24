@@ -228,22 +228,11 @@ jobs:
               "https://dl-cdn.alpinelinux.org/alpine/v3.21/community" > "$R/etc/apk/repositories"
             "$ISH" -r "$R" /sbin/apk add $PKGS
           fi
-          # The versions below decide which images match the catalog by build-id.
-          "$ISH" -r "$R" /bin/sh -c 'for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy openssh-client-default openssh-client-common; do printf "%-16s %s\n" "$p" "$(apk info -e $p 2>/dev/null | head -1)"; done'
-          # catalog-sync.py needs "name version" (no "name-" prefix); this table
-          # is also what the fail-closed check compares the catalog against.
-          "$ISH" -r "$R" /bin/sh -c '
-            for p in musl busybox zlib libcrypto3 libssl3 python3 nodejs sqlite-libs pcre2 py3-pillow libwebp libjpeg-turbo py3-numpy openssh-client-default openssh-client-common; do
-              e=$(apk info -e "$p" 2>/dev/null | head -1)
-              [ -n "$e" ] && printf "%s %s\n" "$p" "${e#$p-}"
-            done' | tee "$GITHUB_WORKSPACE/versions.txt"
+          # `apk info -e` only prints the package name, so read the versions out
+          # of the apk database. The rootfs is a plain directory tree here, so
+          # this runs on the host.
           "$ISH" -r "$R" /bin/sh -c 'musl=$(ls /lib/ld-musl-*.so.1); echo "musl: $musl"; /bin/busybox | head -1; python3 -V'
-          # pcre2grep drives libpcre2-8, which is what the PCRE2 image has to
-          # record. Only the tools package is added: replacing busybox grep with
-          # GNU grep in the guest made the existing workloads hang, so the
-          # workload uses pcre2grep alone.
-          "$ISH" -r "$R" /sbin/apk add pcre2-tools
-          "$ISH" -r "$R" /bin/sh -c 'pcre2grep --version | head -1'
+          awk 'BEGIN{RS="";FS="\n"} {n="";v=""; for(i=1;i<=NF;i++){if($i ~ /^P:/) n=substr($i,3); if($i ~ /^V:/) v=substr($i,3)} if(n!="") print n, v}' "$R/lib/apk/db/installed" | sort
           if [ "${{ inputs.npm }}" = "true" ]; then
             NPM=$(python3 -c "import json;print(' '.join(json.load(open('deps/ish/benchmark/aojit/images.json'))['packages']['npm']))")
             "$ISH" -r "$R" /bin/sh -c "npm i -g --no-audit --no-fund $NPM"
@@ -279,6 +268,12 @@ jobs:
           # AOJITSettingsView.swift lists PCRE2 but benchmark/aojit/images.json
           # has no such workload, so record_images.sh skips it and the entry
           # could never match. record.sh is driven directly for that one module.
+          # pcre2 itself is not in the images.json package list either: it is
+          # installed here, together with pcre2grep (a dynamic client of it).
+          # GNU grep is deliberately NOT installed; replacing busybox grep in the
+          # guest made the other workloads hang for the whole timeout.
+          "$ISH" -r "$R" /sbin/apk add pcre2 pcre2-tools
+          "$ISH" -r "$R" /bin/sh -c 'pcre2grep --version | head -1'
           mkdir -p "$R/tmp/aojit/pcre2" out/rec
           cp "$GITHUB_WORKSPACE/scripts/pcre2_train.sh" "$R/tmp/aojit/pcre2/pcre2_train.sh"
           chmod +x "$R/tmp/aojit/pcre2/pcre2_train.sh"
@@ -334,6 +329,12 @@ jobs:
           # Rewrite the constants to the build-ids just recorded. The gate itself
           # is unchanged: it still demands an exact build-id, only the data is
           # corrected.
+          # The table has to reflect the rootfs *after* pcre2 was installed, so it
+          # is built here rather than with the other packages.
+          awk 'BEGIN{RS="";FS="\n"} {n="";v=""; for(i=1;i<=NF;i++){if($i ~ /^P:/) n=substr($i,3); if($i ~ /^V:/) v=substr($i,3)} if(n!="") print n, v}' \
+            deps/resources/alpine-realfs/lib/apk/db/installed | sort > "$GITHUB_WORKSPACE/versions.txt"
+          grep -E '^(musl|busybox|zlib|libcrypto3|libssl3|python3|nodejs|sqlite-libs|pcre2|py3-pillow|libwebp|libjpeg-turbo|py3-numpy|openssh-client-default|openssh-client-common) ' \
+            "$GITHUB_WORKSPACE/versions.txt"
           python3 "$GITHUB_WORKSPACE/scripts/catalog-sync.py" \
             --manifest out/aot-manifest.json \
             --swift src/ios/Views/Rootfs/AOJITSettingsView.swift \
