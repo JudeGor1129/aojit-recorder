@@ -69,13 +69,13 @@ jobs:
 
       - name: Install build tools
         run: |
-          # llvm is required to compile the guest VDSO (-fuse-ld=lld); it is
-          # keg-only, so its bin dir goes on PATH for the build step.
-          brew install meson ninja libarchive llvm pkg-config
-          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          # lld is required to compile the guest VDSO (-fuse-ld=lld).
+          # Homebrew ships it as its own formula since llvm was split up.
+          brew install meson ninja libarchive lld pkg-config
+          command -v ld.lld
+          ld.lld --version
           python3 -m pip install --user tqdm 2>/dev/null \
             || python3 -m pip install --user --break-system-packages tqdm
-          "$(brew --prefix llvm)/bin/ld.lld" --version
 
       - name: Clone OpenMinis at the pinned ref
         run: |
