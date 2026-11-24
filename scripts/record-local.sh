@@ -46,6 +46,28 @@ git clone --depth 1 --branch "$REF" \
   https://github.com/OpenMinis/OpenMinis.git "$SRC"
 git -C "$SRC" submodule status
 
+say "Patching kernel/uname.c (fortify-safe copies)"
+# do_uname() strcpy()s the host nodename into char hostname[65]. Under the 26
+# SDK that strcpy is fortify-checked, so a hostname that does not fit aborts
+# the whole ish process ("HOST CRASH: signal 5 ... __chk_fail_overflow").
+python3 - "$SRC/deps/ish/kernel/uname.c" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+subs = [
+    ("    struct utsname real_uname;\n    uname(&real_uname);",
+     "    struct utsname real_uname;\n    memset(&real_uname, 0, sizeof(real_uname));\n    uname(&real_uname);"),
+    ("    strcpy(uts->hostname, hostname);",
+     "    snprintf(uts->hostname, sizeof(uts->hostname), \"%s\",\n            hostname != NULL && hostname[0] != '\\0' ? hostname : \"ish\");"),
+]
+for old, new in subs:
+    if old not in s:
+        sys.exit("patch target not found, upstream changed: %r" % old)
+    s = s.replace(old, new, 1)
+p.write_text(s)
+print("patched", p)
+PY
+
 say "Building the CLI iSH (JIT, run-time translation)"
 (
   cd "$SRC/deps/ish"
@@ -73,6 +95,8 @@ echo "abi: $ABI  (Minis 1.15 expects 1f3bb5a0)"
 [ "$ABI" = "1f3bb5a0" ] || echo "WARNING: abi mismatch, the app will reject these images."
 
 say "Installing the guest packages"
+uname -a
+"$ISH" -r "$R" /bin/uname -a || die "guest uname aborted -- kernel/uname.c patch did not take effect"
 # No -u: musl/busybox stay at the minirootfs versions the app ships with.
 MSTR="${MODULES[*]}"
 PKGS=$(cd "$SRC" && MSTR="$MSTR" python3 -c 'import json,os;d=json.load(open("deps/ish/benchmark/aojit/images.json"))["packages"]["apk"];m=os.environ["MSTR"].split();s=set();s.add("github-cli") if "gh" not in m else None;s.add("ripgrep") if "rg" not in m else None;print(" ".join(p for p in d if p not in s))')
